@@ -3,6 +3,7 @@ package prog
 import (
 	_ "encoding/binary"
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 )
@@ -11,32 +12,104 @@ var (
 	simpleProgText = "syz_test$simple_test_call(0x%x)\n"
 )
 
-// Dumb test.
-func TestHintsSimple(t *testing.T) {
-	m := CompMap{
-		0xdeadbeef: uint64Set{0xcafebabe: true},
+func TestHints(t *testing.T) {
+	type Test struct {
+		name  string
+		in    uint64
+		comps CompMap
+		res   []uint64
 	}
-	expected := []string{
-		getSimpleProgText(0xcafebabe),
+	var tests = []Test{
+		{
+			"Dumb test",
+			0xdeadbeef,
+			CompMap{0xdeadbeef: uint64Set{0xcafebabe: true}},
+			[]uint64{0xcafebabe},
+		},
+		// Test for cases when there's multiple comparisons (op1, op2), (op1, op3), ...
+		// Checks that for every such operand a program is generated.
+		{
+			0xabcd,
+			CompMap{0xabcd: uint64Set{0x1: true, 0x2: true, 0x3: true}},
+			[]uint64{0x1, 0x2, 0x4},
+		},
 	}
-	runSimpleTest(m, expected, t, 0xdeadbeef)
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
+			sort.Slice(test.res, func(i, j) bool {
+				return test.res[i] < test.res[j]
+			})
+			res := getReplacersForVal(test.in, test.comps)
+			if !reflect.DeepEqual(res, test.res) {
+				t.Fatalf("got : %v\nwant: %v", got, want)
+			}
+		})
+	}
 }
 
-// Test for cases when there's multiple comparisons (op1, op2), (op1, op3), ...
-// Checks that for every such operand a program is generated.
-func TestHintsMultipleOps(t *testing.T) {
-	m := CompMap{
-		0xabcd: uint64Set{0x1: true, 0x2: true, 0x3: true},
+func TestHintsData(t *testing.T) {
+	type Test struct {
+		in    string
+		comps CompMap
+		res   []string
 	}
-	expected := []string{
-		getSimpleProgText(0x1),
-		getSimpleProgText(0x2),
-		getSimpleProgText(0x3),
+	var tests = []Test{
+		// Dumb test.
+		{
+			"abcdef",
+			CompMap{"cd": uint64Set{"42": true}},
+			[]string{"ab42ef"},
+		},
+		{
+			"\xde\xad\xbe\xef\x44\x45",
+			CompMap{0xdead: uint64Set{"42": true}},
+			[]string{"ab42ef"},
+		},
+		{
+			[]byte{0x01, 0x02, 0x01, 0x02, 0x01, 0x02},
+			CompMap{[]byte{0x01, 0x02}: uint64Set{[]byte{0x08, 0x09}: true}},
+			[][]byte{[]byte{0x08, 0x09, 0x01, 0x02, 0x01, 0x02}},
+		},
+		// Test for cases when there's multiple comparisons (op1, op2), (op1, op3), ...
+		// Checks that for every such operand a program is generated.
+		{
+			0xabcd,
+			CompMap{0xabcd: uint64Set{0x1: true, 0x2: true, 0x3: true}},
+			[]uint64{0x1, 0x2, 0x4},
+		},
 	}
-	runSimpleTest(m, expected, t, 0xabcd)
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%+v", test), func(t *testing.T) {
+			p, _ := Deserialize([]byte(getSimpleProgText(test.in)))
+			var got []string
+			p.MutateWithHints([]CompMap{test.comps}, func(newP *Prog) {
+				got = append(got, string(newP.Serialize()))
+			})
+			var want []string
+			for _, res := range test.res {
+				want = append(want, getSimpleProgText(res))
+			}
+			sort.Strings(got)
+			sort.Strings(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("got : %v\nwant: %v", got, want)
+			}
+		})
+	}
 }
 
-// Test for cases, described in shrinkMutation() function.
+func testCommon(t *testing.T, p *prog, want []string, comps CompMap) {
+	var got []string
+	p.MutateWithHints([]CompMap{test.comps}, func(newP *Prog) {
+		got = append(got, string(newP.Serialize()))
+	})
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got : %v\nwant: %v", got, want)
+	}
+}
+
 func TestHintsConstArgShrinkSize(t *testing.T) {
 	m := CompMap{
 		0xab: uint64Set{0x1: true},
@@ -84,97 +157,6 @@ func TestHintsConstArgExpandSize(t *testing.T) {
 		getSimpleProgText(0x1),
 	}
 	runSimpleTest(m, expected, t, 0xab)
-}
-
-// Test for Little/Big Endian conversions.
-func TestHintsConstArgEndianness(t *testing.T) {
-	m := CompMap{
-		0xbeef:             uint64Set{0x1234: true},
-		0xefbe:             uint64Set{0xabcd: true},
-		0xefbe000000000000: uint64Set{0xabcd: true},
-		0xdeadbeef:         uint64Set{0x1234: true},
-		0xefbeadde:         uint64Set{0xabcd: true},
-		0xefbeadde00000000: uint64Set{0xabcd: true},
-		0x1234567890abcdef: uint64Set{0x1234: true},
-		0xefcdab9078563412: uint64Set{0xabcd: true},
-	}
-	expected := []string{
-		getSimpleProgText(0x1234),
-		getSimpleProgText(0xcdab),
-		getSimpleProgText(0xcdab000000000000),
-	}
-	runSimpleTest(m, expected, t, 0xbeef)
-	runSimpleTest(m, expected, t, 0xdeadbeef)
-	runSimpleTest(m, expected, t, 0x1234567890abcdef)
-
-	m = CompMap{
-		0xab:               uint64Set{0x1234: true},
-		0xab00000000000000: uint64Set{0x1234: true},
-	}
-	expected = []string{
-		getSimpleProgText(0x1234),
-		getSimpleProgText(0x3412),
-		getSimpleProgText(0x3412000000000000),
-	}
-	runSimpleTest(m, expected, t, 0xab)
-}
-
-// Test for reverse() function.
-func TestHintsReverse(t *testing.T) {
-	// Cut bytes = true.
-	vals := []uint64{0xab, 0xcafe, 0xdeadbeef, 0x1234567890abcdef}
-	expected := []uint64{0xab, 0xfeca, 0xefbeadde, 0xefcdab9078563412}
-	for i, v := range vals {
-		r := reverse(v, true)
-		if r != expected[i] {
-			t.Errorf("Got 0x%x expected 0x%x", r, expected[i])
-		}
-	}
-
-	// Cut bytes = false.
-	vals = []uint64{0xab, 0xcafe, 0xdeadbeef, 0x1234567890abcdef}
-	expected = []uint64{
-		0xab00000000000000,
-		0xfeca000000000000,
-		0xefbeadde00000000,
-		0xefcdab9078563412,
-	}
-	for i, v := range vals {
-		r := reverse(v, false)
-		if r != expected[i] {
-			t.Errorf("Got 0x%x expected 0x%x", r, expected[i])
-		}
-	}
-}
-
-// Test for getMostSignificantByte() function.
-func TestHintsMostSignificantByte(t *testing.T) {
-	vals := []uint64{0x0, 0x01, 0xa2, 0xa3ab, 0xa4abab, 0xa5ababab,
-		0xa6abababab, 0xa7ababababab, 0xa8abababababab, 0xa9ababababababab}
-	type R struct {
-		value byte
-		index int
-		bytes []byte
-	}
-	exp := []R{
-		R{0x00, 0, []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-		R{0x01, 0, []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-		R{0xa2, 0, []byte{0xa2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-		R{0xa3, 1, []byte{0xab, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-		R{0xa4, 2, []byte{0xab, 0xab, 0xa4, 0x00, 0x00, 0x00, 0x00, 0x00}},
-		R{0xa5, 3, []byte{0xab, 0xab, 0xab, 0xa5, 0x00, 0x00, 0x00, 0x00}},
-		R{0xa6, 4, []byte{0xab, 0xab, 0xab, 0xab, 0xa6, 0x00, 0x00, 0x00}},
-		R{0xa7, 5, []byte{0xab, 0xab, 0xab, 0xab, 0xab, 0xa7, 0x00, 0x00}},
-		R{0xa8, 6, []byte{0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xa8, 0x00}},
-		R{0xa9, 7, []byte{0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xa9}},
-	}
-	for i, v := range vals {
-		value, index, bytes := getMostSignificantByte(v)
-		bytesEqual := !byteArraysDifferent(bytes, exp[i].bytes)
-		if !bytesEqual || value != exp[i].value || index != exp[i].index {
-			t.Error("got", value, index, bytes, "expected", exp[i])
-		}
-	}
 }
 
 // Helper functions.
